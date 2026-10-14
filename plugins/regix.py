@@ -202,6 +202,22 @@ async def execute_public_forwarding(bot, callback_query):
                    transmission_state.add('filtered')
                    continue
                 if msg_obj.empty or msg_obj.service:
+                   # Do not let a later skipped ID advance the cursor past messages
+                   # still waiting in an uncheckpointed native-forward batch.
+                   if tag_flag and MESSAGE_BATCH_QUEUE:
+                      pending_ids = list(MESSAGE_BATCH_QUEUE)
+                      pending_ok = await execute_batch_forward(
+                          node_client, pending_ids, status_msg, transmission_state, protect_flag
+                      )
+                      for pending_id in pending_ids:
+                         await db.checkpoint_forwarding_message(
+                             task_id, pending_id,
+                             "forwarded" if pending_ok else "failed",
+                             None if pending_ok else "batch forward failed",
+                         )
+                      if pending_ok:
+                         transmission_state.add('total_files', len(pending_ids))
+                      MESSAGE_BATCH_QUEUE = []
                    transmission_state.add('deleted')
                    await db.checkpoint_forwarding_message(task_id, msg_obj.id, "skipped", "empty_or_service")
                    continue
