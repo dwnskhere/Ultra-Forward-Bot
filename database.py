@@ -312,6 +312,21 @@ class Database:
              "$unset": {"lease_owner": "", "lease_expires_at": ""}},
         )
 
+    async def owns_forwarding_lease(self, task_id):
+        """Return whether this worker still owns a non-expired lease for a task."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        return bool(await self.forwarding_tasks.find_one(
+            {
+                "task_id": str(task_id),
+                "status": "running",
+                "lease_owner": self.worker_id,
+                "lease_expires_at": {"$gt": now},
+            },
+            {"_id": 1},
+        ))
+
     async def heartbeat_owned_tasks(self):
         """Renew all leases currently owned by this process."""
         from datetime import datetime, timedelta, timezone
@@ -345,8 +360,8 @@ class Database:
             # update did not, replaying this checkpoint repairs the cursor without
             # incrementing outcome counters twice.
             if getattr(exc, "code", None) == 11000:
-                await self.forwarding_tasks.update_one(
-                    {"task_id": str(task_id), "lease_owner": self.worker_id},
+                repaired = await self.forwarding_tasks.update_one(
+                    {"task_id": str(task_id), "status": "running", "lease_owner": self.worker_id},
                     {"$max": {
                         "cursor_message_id": message_id,
                         "last_confirmed_message_id": message_id,
@@ -357,6 +372,8 @@ class Database:
                          "lease_expires_at": now + timedelta(seconds=180),
                      }},
                 )
+                if repaired.matched_count == 0:
+                    raise RuntimeError(f"Lost forwarding-task lease for {task_id}")
                 return False
             raise
 
@@ -365,8 +382,8 @@ class Database:
             else "failed" if outcome == "failed"
             else "skipped"
         )
-        await self.forwarding_tasks.update_one(
-            {"task_id": str(task_id), "lease_owner": self.worker_id},
+        result = await self.forwarding_tasks.update_one(
+            {"task_id": str(task_id), "status": "running", "lease_owner": self.worker_id},
             {"$max": {
                 "cursor_message_id": message_id,
                 "last_confirmed_message_id": message_id,
@@ -378,6 +395,8 @@ class Database:
                  "lease_expires_at": now + timedelta(seconds=180),
              }},
         )
+        if result.matched_count == 0:
+            raise RuntimeError(f"Lost forwarding-task lease for {task_id}")
         return True
 
     async def update_forwarding_task(self, task_id, fields):
@@ -393,7 +412,9 @@ class Database:
         elif payload.get("status") in ("running", "recovering"):
             payload["lease_expires_at"] = now + timedelta(seconds=180)
             payload.setdefault("lease_owner", self.worker_id)
-        await self.forwarding_tasks.update_one({"task_id": str(task_id)}, update)
+        await self.forwarding_tasks.update_one(
+            {"task_id": str(task_id), "lease_owner": self.worker_id}, update
+        )
 
     async def get_latest_forwarding_task(self, owner_id):
         return await self.forwarding_tasks.find_one(
