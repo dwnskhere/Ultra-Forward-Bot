@@ -51,6 +51,9 @@ class Bot(Client):
         stale_count = await db.mark_interrupted_forwarding_tasks()
         if stale_count:
             logging.warning("Marked %s forwarding task(s) with expired leases for recovery.", stale_count)
+        self._forwarding_heartbeat_task = asyncio.create_task(
+            self._forwarding_heartbeat_loop(), name="forwarding-lease-heartbeat"
+        )
         self._forwarding_recovery_task = asyncio.create_task(
             self._forwarding_recovery_loop(), name="forwarding-recovery-worker"
         )
@@ -75,11 +78,21 @@ class Bot(Client):
                  f"success: {success}"
                  f"failed: {failed}")
 
+    async def _forwarding_heartbeat_loop(self):
+        """Keep active-task leases alive independently of long recovery runs."""
+        while True:
+            try:
+                await db.heartbeat_owned_tasks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Forwarding lease heartbeat failed")
+            await asyncio.sleep(15)
+
     async def _forwarding_recovery_loop(self):
         """Renew live leases and resume abandoned tasks one at a time."""
         while True:
             try:
-                await db.heartbeat_owned_tasks()
                 await db.mark_interrupted_forwarding_tasks()
                 task = await db.claim_next_recoverable_task()
                 if task:
@@ -130,13 +143,14 @@ class Bot(Client):
 
     async def stop(self, *args):
         msg = f"@{self.username} stopped. Bye."
-        recovery_task = getattr(self, "_forwarding_recovery_task", None)
-        if recovery_task and not recovery_task.done():
-            recovery_task.cancel()
-            try:
-                await recovery_task
-            except asyncio.CancelledError:
-                pass
+        for task_name in ("_forwarding_recovery_task", "_forwarding_heartbeat_task"):
+            background_task = getattr(self, task_name, None)
+            if background_task and not background_task.done():
+                background_task.cancel()
+                try:
+                    await background_task
+                except asyncio.CancelledError:
+                    pass
         await super().stop()
         logging.info(msg)
 
