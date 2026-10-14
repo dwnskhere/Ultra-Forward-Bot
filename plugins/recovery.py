@@ -163,6 +163,7 @@ async def recover_forwarding_task(bot, task):
         # update. Check only the first unconfirmed region until a fresh outcome is
         # reached; serial processing means there can be at most a small such gap.
         reconcile_cursor_gap = True
+        processed_since_lease_check = 0
         async for msg in node_client.iter_messages(
             node_client,
             chat_id=source,
@@ -174,6 +175,12 @@ async def recover_forwarding_task(bot, task):
             message_id = int(getattr(msg, "id", 0) or 0)
             if message_id <= cursor:
                 continue
+
+            processed_since_lease_check += 1
+            if processed_since_lease_check >= 20:
+                if not await db.owns_forwarding_lease(task_id):
+                    raise RuntimeError(f"Lost forwarding-task lease for {task_id}")
+                processed_since_lease_check = 0
 
             if reconcile_cursor_gap:
                 existing = await db.get_forwarding_message_outcome(task_id, message_id)
