@@ -7,6 +7,7 @@
 import os
 import sys
 import asyncio 
+from html import escape
 import logging
 from database import db, mongodb_version
 from config import Config, temp
@@ -77,6 +78,53 @@ async def initialize_start_sequence(client_bot, message_obj):
         reply_markup=layout_markup,
         quote=True
     )
+
+@Client.on_message(filters.private & filters.command(["fwdstatus"]))
+async def latest_forwarding_status(client_bot, message_obj):
+    """Show the caller's most recent durable forwarding task and known failures."""
+    if not message_obj.from_user:
+        return
+    task = await db.get_latest_forwarding_task(message_obj.from_user.id)
+    if not task:
+        return await message_obj.reply_text(
+            "No forwarding task has been recorded for your account yet."
+        )
+
+    counts = task.get("counts") or {}
+    forwarded = int(counts.get("forwarded", 0))
+    skipped = int(counts.get("skipped", 0))
+    failed = int(counts.get("failed", 0))
+    processed = int(counts.get("processed", forwarded + skipped + failed))
+    cursor = task.get("last_confirmed_message_id", task.get("cursor_message_id", 0))
+    failure_ids = await db.get_failed_message_ids(task["task_id"], limit=10)
+    failure_text = ", ".join(str(item) for item in failure_ids) if failure_ids else "None recorded"
+    status = escape(str(task.get("status", "unknown")).replace("_", " "))
+    source = escape(str(task.get("source_chat_id", "Unknown")))
+    destination = escape(str(task.get("destination_chat_id", "Unknown")))
+    task_id = escape(str(task.get("task_id", "Unknown")))
+    started = task.get("created_at")
+    started_text = escape(started.strftime("%Y-%m-%d %H:%M UTC")) if hasattr(started, "strftime") else "Unknown"
+
+    report = (
+        "<b>Latest Forwarding Task</b>\n\n"
+        f"<b>Task ID:</b> <code>{task_id}</code>\n"
+        f"<b>Status:</b> <code>{status}</code>\n"
+        f"<b>Source:</b> <code>{source}</code>\n"
+        f"<b>Destination:</b> <code>{destination}</code>\n"
+        f"<b>Started:</b> <code>{started_text}</code>\n\n"
+        f"<b>Processed:</b> <code>{processed}</code>\n"
+        f"<b>Successfully forwarded:</b> <code>{forwarded}</code>\n"
+        f"<b>Skipped:</b> <code>{skipped}</code>\n"
+        f"<b>Failed:</b> <code>{failed}</code>\n"
+        f"<b>Last confirmed source message ID:</b> <code>{cursor}</code>\n\n"
+        f"<b>Known failed source message IDs (max 10):</b>\n<code>{escape(failure_text)}</code>"
+    )
+    await message_obj.reply_text(
+        report,
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------
 # 🔄 ꜱʏꜱᴛᴇᴍ ʀᴇʙᴏᴏᴛ ᴘʀᴏᴛᴏᴄᴏʟ [ᴀᴅᴍɪɴ ᴏɴʟʏ]
