@@ -85,7 +85,7 @@ async def recover_forwarding_task(bot, task):
 
     # A user's existing task takes priority over recovery. Release this claim
     # briefly rather than running two jobs for the same owner.
-    if temp.lock.get(owner_id):
+    if temp.lock.get(owner_id) or destination in temp.IS_FRWD_CHAT:
         await db.defer_forwarding_task(task_id, delay_seconds=15)
         return
 
@@ -134,7 +134,7 @@ async def recover_forwarding_task(bot, task):
             caption_template = legacy_config.get("caption")
     inline_button = parse_buttons(button_payload or "", markup=True)
     forward_tag = bool(task.get("forward_tag"))
-    if temp.lock.get(owner_id):
+    if temp.lock.get(owner_id) or destination in temp.IS_FRWD_CHAT:
         await db.defer_forwarding_task(task_id, delay_seconds=15)
         return
     temp.lock[owner_id] = True
@@ -202,6 +202,12 @@ async def recover_forwarding_task(bot, task):
                 reconcile_cursor_gap = False
 
             if getattr(msg, "empty", False) or getattr(msg, "service", False):
+                # Pending earlier IDs must be settled before this later ID can
+                # advance the monotonic checkpoint.
+                if forward_tag and batch_ids:
+                    await _flush_batch(node_client, batch_ids, task, state)
+                    cursor = batch_ids[-1]
+                    batch_ids = []
                 await db.checkpoint_forwarding_message(
                     task_id, message_id, "skipped", "empty_or_service"
                 )
