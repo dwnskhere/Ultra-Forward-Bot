@@ -21,7 +21,7 @@ class Config:
 
     @classmethod
     def validate(cls):
-        """Fail fast with a useful message when required deployment settings are missing."""
+        """Fail fast with actionable errors before creating a Telegram client."""
         required = {
             "API_ID": cls.API_ID,
             "API_HASH": cls.API_HASH,
@@ -29,11 +29,28 @@ class Config:
             "OWNER_ID": cls.OWNER_ID,
             "DB_URL (or DATABASE_URI)": cls.DB_URL,
         }
-        missing = [name for name, value in required.items() if not value]
+        missing = [
+            name for name, value in required.items()
+            if value is None or (isinstance(value, str) and not value.strip()) or value == []
+        ]
         if missing:
             raise RuntimeError(
                 "Missing required environment variables: " + ", ".join(missing)
             )
+
+        try:
+            numeric_api_id = int(str(cls.API_ID).strip())
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "Invalid API_ID: it must be the numeric Telegram API ID from "
+                "https://my.telegram.org, not the API_HASH. Check Heroku Settings > "
+                "Config Vars; API_ID and API_HASH may have been swapped."
+            ) from None
+        if numeric_api_id <= 0:
+            raise RuntimeError("Invalid API_ID: it must be a positive integer.")
+
+        # Pyrogram accepts an integer; normalizing here avoids delayed type errors.
+        cls.API_ID = numeric_api_id
 
 
 class temp:
