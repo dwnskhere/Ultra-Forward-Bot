@@ -217,7 +217,7 @@ class Database:
             "lease_expires_at": now + timedelta(seconds=180),
             "cursor_message_id": initial_cursor,
             "last_confirmed_message_id": initial_cursor,
-            "counts": {"forwarded": 0, "skipped": 0, "failed": 0},
+            "counts": {"processed": 0, "forwarded": 0, "skipped": 0, "failed": 0},
             "attempt": 0,
         })
         await self.forwarding_tasks.update_one(
@@ -317,8 +317,22 @@ class Database:
                 "created_at": now,
             })
         except Exception as exc:
-            # PyMongo and Motor duplicate-key errors expose code 11000.
+            # If the outcome insert succeeded just before a crash but its cursor
+            # update did not, replaying this checkpoint repairs the cursor without
+            # incrementing outcome counters twice.
             if getattr(exc, "code", None) == 11000:
+                await self.forwarding_tasks.update_one(
+                    {"task_id": str(task_id), "lease_owner": self.worker_id},
+                    {"$max": {
+                        "cursor_message_id": message_id,
+                        "last_confirmed_message_id": message_id,
+                    },
+                     "$set": {
+                         "updated_at": now,
+                         "heartbeat_at": now,
+                         "lease_expires_at": now + timedelta(seconds=180),
+                     }},
+                )
                 return False
             raise
 
@@ -333,7 +347,7 @@ class Database:
                 "cursor_message_id": message_id,
                 "last_confirmed_message_id": message_id,
             },
-             "$inc": {f"counts.{count_key}": 1},
+             "$inc": {f"counts.{count_key}": 1, "counts.processed": 1},
              "$set": {
                  "updated_at": now,
                  "heartbeat_at": now,
@@ -364,6 +378,12 @@ class Database:
 
     async def get_forwarding_task(self, task_id):
         return await self.forwarding_tasks.find_one({"task_id": str(task_id)})
+
+    async def get_forwarding_message_outcome(self, task_id, source_message_id):
+        return await self.forwarding_message_outcomes.find_one(
+            {"task_id": str(task_id), "source_message_id": int(source_message_id)},
+            {"_id": 0, "outcome": 1, "error": 1},
+        )
 
     async def get_failed_message_ids(self, task_id, limit=10):
         cursor = self.forwarding_message_outcomes.find(
