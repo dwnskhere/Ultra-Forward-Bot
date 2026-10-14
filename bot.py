@@ -94,7 +94,12 @@ class Bot(Client):
         while True:
             try:
                 await db.mark_interrupted_forwarding_tasks()
-                task = await db.claim_next_recoverable_task()
+                busy_owners = [
+                    int(owner_id) for owner_id, is_locked in temp.lock.items() if is_locked
+                ]
+                task = await db.claim_next_recoverable_task(
+                    excluded_owner_ids=busy_owners
+                )
                 if task:
                     from datetime import datetime, timedelta, timezone
                     from plugins.recovery import recover_forwarding_task, retry_delay_seconds
