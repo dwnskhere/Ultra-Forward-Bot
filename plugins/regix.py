@@ -144,6 +144,16 @@ async def execute_public_forwarding(bot, callback_query):
     if not claimed_task:
         await edit_display_msg(status_msg, "<b>⚠️ ᴛʜɪꜱ ᴛᴀꜱᴋ ɪꜱ ᴀʟʀᴇᴀᴅʏ ʙᴇɪɴɢ ᴘʀᴏᴄᴇꜱꜱᴇᴅ ʙʏ ᴀɴᴏᴛʜᴇʀ ᴡᴏʀᴋᴇʀ.</b>")
         return await terminate_node(node_client, client_id)
+
+    # Continue strictly after the last persisted source ID, restoring durable counters.
+    resume_cursor = int(claimed_task.get("last_confirmed_message_id",
+                                         claimed_task.get("cursor_message_id", 0)) or 0)
+    cached_state = transmission_state.get()
+    cached_state["fetched"] = resume_cursor
+    persisted_counts = claimed_task.get("counts", {})
+    cached_state["total_files"] = int(persisted_counts.get("forwarded", 0))
+    cached_state["deleted"] = int(persisted_counts.get("failed", 0))
+    cached_state["duplicate"] = int(persisted_counts.get("skipped", 0))
     await dispatch_alert(node_client, client_id, "<b>🚀 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ᴇɴɢɪɴᴇ ɪɢɴɪᴛᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ!</b>")
     
     transmission_state.add(time=True)
@@ -166,7 +176,7 @@ async def execute_public_forwarding(bot, callback_query):
             node_client,
             chat_id=transmission_state.get('FROM'), 
             limit=int(transmission_state.get('limit')), 
-            offset=int(transmission_state.get('skip')) if transmission_state.get('skip') else 0
+            offset=resume_cursor
             ):
                 # Check for kill switch
                 if await verify_kill_switch(node_client, client_id, status_msg, transmission_state):
