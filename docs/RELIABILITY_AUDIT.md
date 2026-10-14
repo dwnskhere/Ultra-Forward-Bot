@@ -1,6 +1,6 @@
 # Reliability audit and recovery plan
 
-Reviewed on 2026-10-14 against `main`.
+Reviewed on 2026-10-14 against `main`; implementation status reflects the recovery branch.
 
 ## Findings
 
@@ -31,13 +31,13 @@ Reviewed on 2026-10-14 against `main`.
 
 ## Recovery design requirements
 
-A correct implementation must persist, at minimum:
+Recovery implementation in this branch persists:
 
-- Stable task ID, owner, source chat, destination chat, source range, and all forwarding options.
-- Status (`queued`, `running`, `paused`, `completed`, `cancelled`, `failed`), created/updated timestamps, lease/heartbeat, and attempt count.
-- A durable cursor and counts for forwarded, skipped, filtered, duplicate, and failed messages.
-- Per-message outcomes keyed uniquely by task ID and source message ID, with failure class and retry count.
-- Atomic cursor/outcome updates and a startup recovery routine that reclaims only stale leases.
+- Stable task ID, owner, source chat, destination chat, source ID boundary, selected node reference, caption/button payload, and sanitized settings snapshot.
+- Status, timestamps, worker lease, heartbeat, retry attempt count, and last confirmed source message ID.
+- Per-message outcomes uniquely keyed by task ID and source message ID, plus aggregate processed/forwarded/skipped/failed counters.
+- Atomic worker claims, lease renewal, startup recovery of interrupted/stale tasks, and `/fwdstatus` reporting.
+- Separate `completed` and `completed_with_errors` terminal states.
 
 ### Delivery guarantee
 
@@ -56,18 +56,16 @@ Telegram send/copy and MongoDB cannot participate in one atomic transaction. If 
 
 ## Verification status
 
-Repository inspection and branch edits are complete for the deployment/configuration stage. A live Heroku build, live Telegram forwarding test, and production recovery test require the owner's deployment environment and credentials; they are not claimed as passed here. Do not enable unattended auto-resume of large jobs until the recovery tests above pass.
+The branch includes automated CI checks for Python compilation, iterator checkpoint boundaries, resume-from-checkpoint behavior, terminal status classification, retry backoff, and `app.json` JSON parsing. Those tests do not replace a live Telegram/Heroku staging test with a controlled restart and real MongoDB lease contention. No live deployment or Telegram integration test is claimed as passed.
 
+## Recovery behavior and remaining limitations
 
-## Implementation status after recovery-stage changes
+- The bot renews leases for active tasks and only reclaims tasks whose lease has expired or whose status is interrupted/recovering.
+- Recovery reloads the originally selected node by owner and node ID, revalidates source/destination access, reconciles outcome counters from MongoDB, then resumes after the saved source message ID.
+- Task outcomes are idempotently keyed by task ID + source message ID. A checkpoint repair handles the crash window between outcome insertion and task-counter/cursor update.
+- A task with recorded delivery failures ends as `completed_with_errors`. `/fwdstatus` reports the latest task and up to 10 failed source IDs.
+- Per-message unexpected errors are retried up to three times; worker-level recovery failures use bounded exponential delay and stop after five attempts, setting `needs_attention`.
 
-The current branch now includes:
-- A dedicated MongoDB `forwarding_tasks` collection and `forwarding_message_outcomes` ledger.
-- Unique task/message indexes and idempotent outcome inserts.
-- Checkpoint writes for individual-copy outcomes and batch outcomes.
-- An explicit final partial-batch flush.
-- Startup detection of tasks left in `running` / `recovering` and owner notification while retaining checkpoints.
+Telegram delivery and MongoDB checkpoint writes cannot be one atomic operation. The guarantee remains at-least-once: a crash between an accepted Telegram send and its checkpoint can duplicate a single copy-mode message, or an uncheckpointed native-forward batch of up to 50 source IDs. If the stored node has been removed, the task requires operator attention rather than switching credentials.
 
-**Important remaining gap:** automatic re-execution from the saved checkpoint is not yet enabled. The task envelope does not yet persist every runtime dependency (notably a validated, recoverable node credential reference and all filter/duplicate-check settings), and replaying from a cursor without reconciling destination messages can duplicate content. Startup therefore surfaces interrupted tasks instead of silently replaying them. This is safer than losing task records, but it does not satisfy unattended automatic recovery yet.
-
-The next implementation stage must persist the complete sanitized execution plan, restore/revalidate the chosen node, implement a lease-based resume worker that reuses the same forwarding engine, and add crash-window tests. Do not describe this branch as providing automatic resume until that stage is complete.
+Before production rollout, run a staging test with a small channel and persistent MongoDB, then restart the Heroku worker during copy mode and native-forward mode. Also verify lease contention across two worker instances and inspect `/fwdstatus` after recovery.
