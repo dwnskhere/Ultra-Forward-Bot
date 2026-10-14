@@ -45,6 +45,33 @@ class Bot(Client):
         self.set_parse_mode(ParseMode.DEFAULT)
         text = "**Bot Restarted !**"
         logging.info(text)
+
+        # Ensure durable recovery collections/indexes exist before accepting work.
+        await db.ensure_forwarding_indexes()
+        interrupted = await db.mark_interrupted_forwarding_tasks()
+        if interrupted:
+            logging.warning(
+                "%s forwarding task(s) were interrupted. Their durable checkpoints "
+                "are retained; automatic replay is intentionally not attempted until "
+                "the task's original node/session and options can be revalidated.",
+                interrupted,
+            )
+            tasks = await db.forwarding_tasks.find({"status": "interrupted"}).to_list(length=500)
+            for task in tasks:
+                try:
+                    await self.send_message(
+                        int(task["owner_id"]),
+                        "⚠️ A forwarding task was interrupted by a worker restart. "
+                        f"Task ID: {task['task_id']} | Last checkpoint: "
+                        f"{task.get('cursor_message_id', 0)}. "
+                        "The checkpoint is saved, but this version does not auto-replay "
+                        "the task because Telegram may have accepted a message immediately "
+                        "before the crash. Please review the destination before retrying.",
+                    )
+                except Exception as notify_error:
+                    logging.warning("Could not notify owner for interrupted task %s: %s",
+                                     task.get("task_id"), notify_error)
+
         success = failed = 0
         users = await db.get_all_frwd()
         async for user in users:
