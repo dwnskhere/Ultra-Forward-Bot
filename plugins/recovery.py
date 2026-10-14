@@ -83,6 +83,12 @@ async def recover_forwarding_task(bot, task):
         await _notify(bot, owner_id, f"Forwarding task {task_id} needs attention: saved task settings are incomplete.")
         return
 
+    # A user's existing task takes priority over recovery. Release this claim
+    # briefly rather than running two jobs for the same owner.
+    if temp.lock.get(owner_id):
+        await db.defer_forwarding_task(task_id, delay_seconds=15)
+        return
+
     active_node = await db.get_node_for_task(owner_id, node_id)
     if not active_node:
         await db.update_forwarding_task(task_id, {
@@ -128,6 +134,9 @@ async def recover_forwarding_task(bot, task):
             caption_template = legacy_config.get("caption")
     inline_button = parse_buttons(button_payload or "", markup=True)
     forward_tag = bool(task.get("forward_tag"))
+    if temp.lock.get(owner_id):
+        await db.defer_forwarding_task(task_id, delay_seconds=15)
+        return
     temp.lock[owner_id] = True
     temp.forwardings += 1
     if destination not in temp.IS_FRWD_CHAT:
