@@ -125,17 +125,25 @@ async def execute_public_forwarding(bot, callback_query):
     await db.add_frwd(client_id)
     task_id = str(transmission_id)
     await db.ensure_forwarding_indexes()
+    node_configs = await db.get_configs(client_id)
     await db.create_forwarding_task({
         "task_id": task_id, "owner_id": int(client_id),
         "source_chat_id": transmission_state.get("FROM"),
         "destination_chat_id": transmission_state.get("TO"),
         "limit": int(transmission_state.get("limit") or 0),
         "skip": int(transmission_state.get("skip") or 0),
+        "start_message_id": int(transmission_state.get("skip") or 0),
         "active_node_id": active_node.get("id"),
         "active_node_is_bot": bool(active_node.get("is_bot")),
         "forward_tag": bool(tag_flag), "protect_content": bool(protect_flag),
-        "caption_template": cap_payload, "transmission_id": str(transmission_id),
+        "caption_template": cap_payload, "button_payload": node_configs.get("button"),
+        "settings_snapshot": metadata,
+        "transmission_id": str(transmission_id),
     })
+    claimed_task = await db.claim_forwarding_task(task_id)
+    if not claimed_task:
+        await edit_display_msg(status_msg, "<b>⚠️ ᴛʜɪꜱ ᴛᴀꜱᴋ ɪꜱ ᴀʟʀᴇᴀᴅʏ ʙᴇɪɴɢ ᴘʀᴏᴄᴇꜱꜱᴇᴅ ʙʏ ᴀɴᴏᴛʜᴇʀ ᴡᴏʀᴋᴇʀ.</b>")
+        return await terminate_node(node_client, client_id)
     await dispatch_alert(node_client, client_id, "<b>🚀 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ᴇɴɢɪɴᴇ ɪɢɴɪᴛᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ!</b>")
     
     transmission_state.add(time=True)
@@ -173,11 +181,9 @@ async def execute_public_forwarding(bot, callback_query):
                 # Filter Handlers
                 if msg_obj == "DUPLICATE":
                    transmission_state.add('duplicate')
-                   await db.checkpoint_forwarding_message(task_id, transmission_state.get('fetched'), "skipped", "duplicate")
                    continue
                 elif msg_obj == "FILTERED":
                    transmission_state.add('filtered')
-                   await db.checkpoint_forwarding_message(task_id, transmission_state.get('fetched'), "skipped", "filtered")
                    continue
                 if msg_obj.empty or msg_obj.service:
                    transmission_state.add('deleted')
@@ -221,8 +227,15 @@ async def execute_public_forwarding(bot, callback_query):
                    
         except Exception as critical_err:
             sys_logger.error(f"Critical Transmission Error: {critical_err}")
+            from datetime import datetime, timedelta, timezone
+            await db.update_forwarding_task(task_id, {
+                "status": "interrupted",
+                "last_error": str(critical_err)[:1000],
+                "retry_after": datetime.now(timezone.utc) + timedelta(seconds=30),
+            })
             await edit_display_msg(status_msg, f"<blockquote><b><u>❌ ꜰᴀᴛᴀʟ ꜱʏꜱᴛᴇᴍ ᴇʀʀᴏʀ</u></b></blockquote>\n\n<code>{critical_err}</code>\n\n<b>🛡️ @IND_BOTZ</b>", wait=True)
-            temp.IS_FRWD_CHAT.remove(transmission_state.TO)
+            if transmission_state.TO in temp.IS_FRWD_CHAT:
+                temp.IS_FRWD_CHAT.remove(transmission_state.TO)
             return await terminate_node(node_client, client_id)
             
         # Flush a trailing partial batch even when the remaining-count estimate is off.
@@ -233,7 +246,13 @@ async def execute_public_forwarding(bot, callback_query):
               await db.checkpoint_forwarding_message(task_id, source_message_id, "forwarded" if tail_ok else "failed", None if tail_ok else "final batch failed")
            if tail_ok:
               transmission_state.add('total_files', len(tail_ids))
-        await db.update_forwarding_task(task_id, {"status": "completed"})
+        durable_task = await db.get_forwarding_task(task_id)
+        durable_counts = (durable_task or {}).get("counts", {})
+        final_task_status = "completed_with_errors" if durable_counts.get("failed", 0) else "completed"
+        await db.update_forwarding_task(task_id, {
+            "status": final_task_status,
+            "completed_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        })
         # Success Cleanup
         temp.IS_FRWD_CHAT.remove(transmission_state.TO)
         await dispatch_alert(node_client, client_id, "<b>🎉 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ ᴄᴏᴍᴘʟᴇᴛᴇᴅ!</b>")
@@ -245,56 +264,71 @@ async def execute_public_forwarding(bot, callback_query):
 # ------------------------------------------------------------------------------------------------------------------------------------------------
             
 async def execute_single_copy(active_bot, msg_data, ui_msg, state_obj):
-   """ Highly secured function to copy individual messages and handle FloodWaits smoothly. """
-   try:                                  
-     if msg_data.get("media") and msg_data.get("caption"):
-        await active_bot.send_cached_media(
-              chat_id=state_obj.get('TO'),
-              file_id=msg_data.get("media"),
-              caption=msg_data.get("caption"),
-              reply_markup=msg_data.get('button'),
-              protect_content=msg_data.get("protect"))
-     else:
-        await active_bot.copy_message(
-              chat_id=state_obj.get('TO'),
-              from_chat_id=state_obj.get('FROM'),    
-              caption=msg_data.get("caption"),
-              message_id=msg_data.get("msg_id"),
-              reply_markup=msg_data.get('button'),
-              protect_content=msg_data.get("protect"))
-     return True
-              
-   except FloodWait as flood_err:
-     sys_logger.warning(f"FloodWait triggered for {flood_err.value} seconds.")
-     await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
-     await asyncio.sleep(flood_err.value)
-     await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
-     return await execute_single_copy(active_bot, msg_data, ui_msg, state_obj)
-     
-   except Exception as copy_err:
-     sys_logger.error(f"Copy Error: {copy_err}")
-     state_obj.add('deleted')
-     return False
-        
+   """Copy a message, retrying transient failures without hiding terminal delivery errors."""
+   for attempt in range(3):
+     try:
+       if msg_data.get("media") and msg_data.get("caption"):
+         await active_bot.send_cached_media(
+             chat_id=state_obj.get('TO'),
+             file_id=msg_data.get("media"),
+             caption=msg_data.get("caption"),
+             reply_markup=msg_data.get('button'),
+             protect_content=msg_data.get("protect"))
+       else:
+         await active_bot.copy_message(
+             chat_id=state_obj.get('TO'),
+             from_chat_id=state_obj.get('FROM'),
+             caption=msg_data.get("caption"),
+             message_id=msg_data.get("msg_id"),
+             reply_markup=msg_data.get('button'),
+             protect_content=msg_data.get("protect"))
+       return True
+     except FloodWait as flood_err:
+       sys_logger.warning("FloodWait triggered for %s seconds.", flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
+       await asyncio.sleep(flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
+     except RPCError as copy_err:
+       sys_logger.error("Telegram copy failed: %s", copy_err)
+       state_obj.add('deleted')
+       return False
+     except Exception as copy_err:
+       sys_logger.warning("Unexpected copy error (attempt %s/3): %s", attempt + 1, copy_err)
+       if attempt == 2:
+         state_obj.add('deleted')
+         return False
+       await asyncio.sleep(2 ** attempt)
+   return False
+
+
 async def execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag):
-   """ Batch message forwarder with robust exception handling. """
-   try:                             
-     await active_bot.forward_messages(
+   """Forward a batch; retry unexpected transport errors at most three times."""
+   for attempt in range(3):
+     try:
+       await active_bot.forward_messages(
            chat_id=state_obj.get('TO'),
-           from_chat_id=state_obj.get('FROM'), 
+           from_chat_id=state_obj.get('FROM'),
            protect_content=secure_flag,
            message_ids=msg_batch)
-     return True
-           
-   except FloodWait as flood_err:
-     sys_logger.warning(f"Batch Forward FloodWait: {flood_err.value}s.")
-     await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
-     await asyncio.sleep(flood_err.value)
-     await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
-     return await execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag)
-   except Exception as batch_err:
-     sys_logger.error(f"Batch forward error: {batch_err}")
-     return False
+       return True
+     except FloodWait as flood_err:
+       sys_logger.warning("Batch forward FloodWait: %ss.", flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
+       await asyncio.sleep(flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
+     except RPCError as batch_err:
+       sys_logger.error("Telegram batch forward failed: %s", batch_err)
+       return False
+     except Exception as batch_err:
+       sys_logger.warning("Unexpected batch forward error (attempt %s/3): %s", attempt + 1, batch_err)
+       if attempt == 2:
+         return False
+       await asyncio.sleep(2 ** attempt)
+   return False
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------
 # 🎨 ᴜɪ / ꜱᴛᴀᴛᴜꜱ ᴍᴀɴᴀɢᴇᴍᴇɴᴛ ꜰᴜɴᴄᴛɪᴏɴꜱ
@@ -371,6 +405,7 @@ async def verify_kill_switch(active_bot, client_id, ui_msg, state_obj):
       sys_logger.info(f"Kill switch activated for client {client_id}")
       temp.IS_FRWD_CHAT.remove(state_obj.TO)
       await refresh_ui_status(ui_msg, "ᴀʙᴏʀᴛᴇᴅ", "cancelled", state_obj)
+      await db.update_forwarding_task(str(state_obj.id), {"status": "cancelled"})
       await dispatch_alert(active_bot, client_id, "<b>❌ ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ᴀʙᴏʀᴛᴇᴅ ʙʏ ᴜꜱᴇʀ.</b>")
       await terminate_node(active_bot, client_id)
       return True 
