@@ -176,6 +176,87 @@ class Database:
     async def get_all_frwd(self):
        return self.nfy.find({})
      
+    # Durable forwarding task ledger. The legacy notify collection is only
+    # for restart notices and must never be treated as task progress.
+    @property
+    def forwarding_tasks(self):
+        return self.db.forwarding_tasks
+
+    @property
+    def forwarding_message_outcomes(self):
+        return self.db.forwarding_message_outcomes
+
+    async def ensure_forwarding_indexes(self):
+        await self.forwarding_tasks.create_index("task_id", unique=True)
+        await self.forwarding_tasks.create_index([("status", 1), ("updated_at", 1)])
+        await self.forwarding_tasks.create_index([("owner_id", 1), ("status", 1)])
+        await self.forwarding_message_outcomes.create_index(
+            [("task_id", 1), ("source_message_id", 1)], unique=True
+        )
+
+    async def create_forwarding_task(self, task):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        payload = dict(task)
+        payload.update({
+            "status": "running",
+            "created_at": now,
+            "updated_at": now,
+            "heartbeat_at": now,
+            "cursor_message_id": payload.get("start_message_id", 0),
+            "counts": {"forwarded": 0, "skipped": 0, "failed": 0},
+            "attempt": 0,
+        })
+        await self.forwarding_tasks.update_one(
+            {"task_id": payload["task_id"]}, {"$setOnInsert": payload}, upsert=True
+        )
+        return await self.forwarding_tasks.find_one({"task_id": payload["task_id"]})
+
+    async def checkpoint_forwarding_message(self, task_id, source_message_id, outcome, error=None):
+        """Idempotently record a message result and advance cursor only on first insert."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        key = {"task_id": str(task_id), "source_message_id": int(source_message_id)}
+        try:
+            await self.forwarding_message_outcomes.insert_one({
+                **key, "outcome": outcome, "error": str(error)[:1000] if error else None,
+                "created_at": now,
+            })
+        except Exception as exc:
+            # Duplicate-key means this exact source message was already recorded.
+            if getattr(exc, "code", None) != 11000:
+                raise
+            return False
+        count_key = "forwarded" if outcome == "forwarded" else "failed" if outcome == "failed" else "skipped"
+        await self.forwarding_tasks.update_one(
+            {"task_id": str(task_id)},
+            {"$max": {"cursor_message_id": int(source_message_id)},
+             "$inc": {f"counts.{count_key}": 1},
+             "$set": {"updated_at": now, "heartbeat_at": now}}
+        )
+        return True
+
+    async def update_forwarding_task(self, task_id, fields):
+        from datetime import datetime, timezone
+        fields = dict(fields)
+        fields["updated_at"] = datetime.now(timezone.utc)
+        fields["heartbeat_at"] = fields["updated_at"]
+        await self.forwarding_tasks.update_one({"task_id": str(task_id)}, {"$set": fields})
+
+    async def get_recoverable_forwarding_tasks(self):
+        return self.forwarding_tasks.find({"status": {"$in": ["running", "recovering"]}})
+
+    async def mark_interrupted_forwarding_tasks(self):
+        """Mark abandoned work for explicit safe recovery; never pretend it completed."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        result = await self.forwarding_tasks.update_many(
+            {"status": {"$in": ["running", "recovering"]}},
+            {"$set": {"status": "interrupted", "updated_at": now,
+                      "recovery_note": "Worker restarted; inspect last checkpoint before resuming."}}
+        )
+        return result.modified_count
+
 db = Database(Config.DB_URL, Config.DB_NAME)
 
 
