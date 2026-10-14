@@ -232,14 +232,13 @@ class Database:
         now = datetime.now(timezone.utc)
         query = {
             "task_id": str(task_id),
-            "$and": [
-                {"status": {"$in": ["running", "interrupted", "recovering"]}},
-                {"$or": [
-                    {"lease_owner": self.worker_id},
-                    {"status": {"$in": ["interrupted", "recovering"]}},
-                    {"lease_expires_at": {"$lte": now}},
-                    {"lease_expires_at": {"$exists": False}},
-                ]},
+            "$or": [
+                {"status": "interrupted"},
+                {"status": "running", "lease_owner": self.worker_id},
+                {"status": "running", "lease_expires_at": {"$lte": now}},
+                {"status": "running", "lease_expires_at": {"$exists": False}},
+                {"status": "recovering", "lease_expires_at": {"$lte": now}},
+                {"status": "recovering", "lease_expires_at": {"$exists": False}},
             ],
         }
         claimed = await self.forwarding_tasks.find_one_and_update(
@@ -265,7 +264,11 @@ class Database:
             "$and": [
                 {"attempt": {"$lt": 5}},
                 {"$or": [
-                    {"status": {"$in": ["interrupted", "recovering"]}},
+                    {"status": "interrupted"},
+                    {"status": "recovering", "$or": [
+                        {"lease_expires_at": {"$lte": now}},
+                        {"lease_expires_at": {"$exists": False}},
+                    ]},
                     {"status": "running", "lease_expires_at": {"$lte": now}},
                     {"status": "running", "lease_expires_at": {"$exists": False}},
                 ]},
