@@ -68,6 +68,12 @@ async def start_clone_bot(NodeEngine, data=None):
             fetched_messages = await self.get_messages(chat_id, requested_ids)
             if not isinstance(fetched_messages, (list, tuple)):
                 fetched_messages = [fetched_messages] if fetched_messages else []
+            # Source IDs must be yielded in ascending order: the durable cursor is
+            # monotonic, so reverse-ordered API results could skip unprocessed IDs.
+            fetched_messages = sorted(
+                (item for item in fetched_messages if item is not None),
+                key=lambda item: int(getattr(item, "id", 0) or 0),
+            )
             for single_msg in fetched_messages:
                 if single_msg is not None:
                     yield single_msg
