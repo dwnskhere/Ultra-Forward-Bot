@@ -303,8 +303,9 @@ async def execute_public_forwarding(bot, callback_query):
 # ------------------------------------------------------------------------------------------------------------------------------------------------
             
 async def execute_single_copy(active_bot, msg_data, ui_msg, state_obj):
-   """Copy a message, retrying transient failures without hiding terminal delivery errors."""
-   for attempt in range(3):
+   """Copy a message, retrying unexpected failures at most three times."""
+   attempt = 0
+   while attempt < 3:
      try:
        if msg_data.get("media") and msg_data.get("caption"):
          await active_bot.send_cached_media(
@@ -329,22 +330,25 @@ async def execute_single_copy(active_bot, msg_data, ui_msg, state_obj):
        await asyncio.sleep(flood_err.value)
        if ui_msg is not None:
          await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
+       # A Telegram rate limit is a required wait, not a consumed retry attempt.
      except RPCError as copy_err:
        sys_logger.error("Telegram copy failed: %s", copy_err)
        state_obj.add('deleted')
        return False
      except Exception as copy_err:
-       sys_logger.warning("Unexpected copy error (attempt %s/3): %s", attempt + 1, copy_err)
-       if attempt == 2:
+       attempt += 1
+       sys_logger.warning("Unexpected copy error (attempt %s/3): %s", attempt, copy_err)
+       if attempt >= 3:
          state_obj.add('deleted')
          return False
-       await asyncio.sleep(2 ** attempt)
+       await asyncio.sleep(2 ** (attempt - 1))
    return False
 
 
 async def execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag):
-   """Forward a batch; retry unexpected transport errors at most three times."""
-   for attempt in range(3):
+   """Forward a batch, retrying unexpected transport errors at most three times."""
+   attempt = 0
+   while attempt < 3:
      try:
        await active_bot.forward_messages(
            chat_id=state_obj.get('TO'),
@@ -359,14 +363,16 @@ async def execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure
        await asyncio.sleep(flood_err.value)
        if ui_msg is not None:
          await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
+       # Keep waiting through rate limits without consuming the transient retry budget.
      except RPCError as batch_err:
        sys_logger.error("Telegram batch forward failed: %s", batch_err)
        return False
      except Exception as batch_err:
-       sys_logger.warning("Unexpected batch forward error (attempt %s/3): %s", attempt + 1, batch_err)
-       if attempt == 2:
+       attempt += 1
+       sys_logger.warning("Unexpected batch forward error (attempt %s/3): %s", attempt, batch_err)
+       if attempt >= 3:
          return False
-       await asyncio.sleep(2 ** attempt)
+       await asyncio.sleep(2 ** (attempt - 1))
    return False
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------
