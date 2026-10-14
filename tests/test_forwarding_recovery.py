@@ -42,6 +42,15 @@ class RecoveryHelperTests(unittest.TestCase):
         self.assertEqual(manifest["repository"], "https://github.com/dwnskhere/Ultra-Forward-Bot")
         self.assertIn("DB_URL", manifest["env"])
         self.assertIn("DB_NAME", manifest["env"])
+        self.assertEqual(manifest["stack"], "container")
+        self.assertEqual(manifest["formation"]["worker"]["quantity"], 1)
+        self.assertEqual(manifest["formation"]["worker"]["size"], "basic")
+
+    def test_heroku_manifest_declares_worker_command(self):
+        heroku_manifest = (ROOT / "heroku.yml").read_text(encoding="utf-8")
+        self.assertIn("worker: Dockerfile", heroku_manifest)
+        self.assertIn("worker: python main.py", heroku_manifest)
+        self.assertIn("Deploy to Heroku", (ROOT / "README.md").read_text(encoding="utf-8"))
 
 
 class SourceIteratorTests(unittest.IsolatedAsyncioTestCase):
