@@ -46,31 +46,14 @@ class Bot(Client):
         text = "**Bot Restarted !**"
         logging.info(text)
 
-        # Ensure durable recovery collections/indexes exist before accepting work.
+        # Create indexes and start lease/heartbeat-based task recovery.
         await db.ensure_forwarding_indexes()
-        interrupted = await db.mark_interrupted_forwarding_tasks()
-        if interrupted:
-            logging.warning(
-                "%s forwarding task(s) were interrupted. Their durable checkpoints "
-                "are retained; automatic replay is intentionally not attempted until "
-                "the task's original node/session and options can be revalidated.",
-                interrupted,
-            )
-            tasks = await db.forwarding_tasks.find({"status": "interrupted"}).to_list(length=500)
-            for task in tasks:
-                try:
-                    await self.send_message(
-                        int(task["owner_id"]),
-                        "⚠️ A forwarding task was interrupted by a worker restart. "
-                        f"Task ID: {task['task_id']} | Last checkpoint: "
-                        f"{task.get('cursor_message_id', 0)}. "
-                        "The checkpoint is saved, but this version does not auto-replay "
-                        "the task because Telegram may have accepted a message immediately "
-                        "before the crash. Please review the destination before retrying.",
-                    )
-                except Exception as notify_error:
-                    logging.warning("Could not notify owner for interrupted task %s: %s",
-                                     task.get("task_id"), notify_error)
+        stale_count = await db.mark_interrupted_forwarding_tasks()
+        if stale_count:
+            logging.warning("Marked %s forwarding task(s) with expired leases for recovery.", stale_count)
+        self._forwarding_recovery_task = asyncio.create_task(
+            self._forwarding_recovery_loop(), name="forwarding-recovery-worker"
+        )
 
         success = failed = 0
         users = await db.get_all_frwd()
@@ -92,8 +75,68 @@ class Bot(Client):
                  f"success: {success}"
                  f"failed: {failed}")
 
+    async def _forwarding_recovery_loop(self):
+        """Renew live leases and resume abandoned tasks one at a time."""
+        while True:
+            try:
+                await db.heartbeat_owned_tasks()
+                await db.mark_interrupted_forwarding_tasks()
+                task = await db.claim_next_recoverable_task()
+                if task:
+                    from datetime import datetime, timedelta, timezone
+                    from plugins.recovery import recover_forwarding_task, retry_delay_seconds
+
+                    task_id = str(task["task_id"])
+                    attempt = int(task.get("attempt", 1))
+                    try:
+                        await recover_forwarding_task(self, task)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as recovery_error:
+                        error_text = str(recovery_error)[:1000]
+                        if attempt >= 5:
+                            await db.update_forwarding_task(task_id, {
+                                "status": "needs_attention",
+                                "last_error": error_text,
+                                "recovery_note": "Automatic recovery stopped after five failed attempts.",
+                            })
+                            try:
+                                await self.send_message(
+                                    int(task["owner_id"]),
+                                    f"Forwarding task {task_id} could not be recovered after five attempts. "
+                                    f"Last error: {error_text}",
+                                )
+                            except Exception:
+                                logging.warning("Could not notify owner about task %s", task_id)
+                        else:
+                            retry_after = datetime.now(timezone.utc) + timedelta(
+                                seconds=retry_delay_seconds(attempt)
+                            )
+                            await db.update_forwarding_task(task_id, {
+                                "status": "interrupted",
+                                "last_error": error_text,
+                                "retry_after": retry_after,
+                            })
+                            logging.warning(
+                                "Task %s recovery attempt %s failed; retrying after %s: %s",
+                                task_id, attempt, retry_after.isoformat(), error_text,
+                            )
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Forwarding recovery worker iteration failed")
+            await asyncio.sleep(15)
+
     async def stop(self, *args):
         msg = f"@{self.username} stopped. Bye."
+        recovery_task = getattr(self, "_forwarding_recovery_task", None)
+        if recovery_task and not recovery_task.done():
+            recovery_task.cancel()
+            try:
+                await recovery_task
+            except asyncio.CancelledError:
+                pass
         await super().stop()
         logging.info(msg)
 
