@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from html import escape
 
 from config import temp
 from database import db
@@ -117,22 +116,32 @@ async def recover_forwarding_task(bot, task):
     state_data["start"] = __import__("time").time()
 
     # Settings are captured at task creation so a later settings change does not
-    # silently change the semantics of a long-running task.
-    inline_button = parse_buttons(task.get("button_payload") or "", markup=True)
-    forward_tag = bool(task.get("forward_tag"))
+    # silently change the semantics of a long-running task. Older task records do
+    # not have a snapshot, so use the owner's current button/caption as a fallback.
+    button_payload = task.get("button_payload")
     caption_template = task.get("caption_template")
+    if "settings_snapshot" not in task:
+        legacy_config = await db.get_configs(owner_id)
+        if button_payload is None:
+            button_payload = legacy_config.get("button")
+        if caption_template is None:
+            caption_template = legacy_config.get("caption")
+    inline_button = parse_buttons(button_payload or "", markup=True)
+    forward_tag = bool(task.get("forward_tag"))
     temp.lock[owner_id] = True
+    temp.forwardings += 1
     if destination not in temp.IS_FRWD_CHAT:
         temp.IS_FRWD_CHAT.append(destination)
 
     node_client = None
     batch_ids = []
-    started_at = datetime.now(timezone.utc)
     try:
         node_client = await start_clone_bot(IND_SYS_CLIENT.client(active_node))
-        # Revalidate source access and write permission before replaying any work.
+        # Revalidate source access and destination write permission before replaying.
         await node_client.get_chat(source)
         await node_client.get_chat(destination)
+        probe = await node_client.send_message(destination, "<i>Forwarding recovery permission check.</i>")
+        await probe.delete()
         if limit <= cursor:
             logger.info("Task %s has no source IDs beyond checkpoint %s", task_id, cursor)
         else:
@@ -262,3 +271,4 @@ async def recover_forwarding_task(bot, task):
         if destination in temp.IS_FRWD_CHAT:
             temp.IS_FRWD_CHAT.remove(destination)
         temp.lock[owner_id] = False
+        temp.forwardings = max(0, temp.forwardings - 1)
