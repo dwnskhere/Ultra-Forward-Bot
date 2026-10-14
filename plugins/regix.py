@@ -189,7 +189,9 @@ async def execute_public_forwarding(bot, callback_query):
                    return
                    
                 # Throttle UI Updates
-                if loop_counter % 20 == 0: 
+                if loop_counter % 20 == 0:
+                   if not await db.owns_forwarding_lease(task_id):
+                      raise RuntimeError("Forwarding task lease was lost; stopping this worker.")
                    await refresh_ui_status(status_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, transmission_state)
                 loop_counter += 1
                 transmission_state.add('fetched')
