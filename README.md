@@ -2,6 +2,8 @@
 
 A Telegram channel and chat forwarding bot built with [Pyrofork](https://github.com/KurimuzonAkuma/pyrogram) and MongoDB. It runs as a background **worker**—there is no web dashboard.
 
+**New to the bot?** Start with the [End-to-End User Guide](docs/USER_GUIDE.md), which walks through connected nodes, destination setup, the forwarding prompts, settings, status, recovery, and common errors.
+
 <p align="center">
   <a href="https://www.heroku.com/deploy?template=https://github.com/dwnskhere/Ultra-Forward-Bot">
     <img src="https://www.herokucdn.com/deploy/button.svg" alt="Deploy to Heroku">
