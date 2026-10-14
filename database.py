@@ -255,8 +255,9 @@ class Database:
         )
         return claimed
 
-    async def claim_next_recoverable_task(self):
+    async def claim_next_recoverable_task(self, excluded_owner_ids=None):
         """Claim one interrupted task or one running task whose lease has expired."""
+
         from datetime import datetime, timedelta, timezone
 
         now = datetime.now(timezone.utc)
@@ -274,6 +275,9 @@ class Database:
                 ]},
             ]
         }
+        excluded_owner_ids = [int(owner_id) for owner_id in (excluded_owner_ids or [])]
+        if excluded_owner_ids:
+            query["owner_id"] = {"$nin": excluded_owner_ids}
         return await self.forwarding_tasks.find_one_and_update(
             query,
             {"$set": {
@@ -286,6 +290,23 @@ class Database:
              "$unset": {"retry_after": ""}},
             sort=[("updated_at", 1)],
             return_document=ReturnDocument.AFTER,
+        )
+
+    async def defer_forwarding_task(self, task_id, delay_seconds=15):
+        """Release a claimed task without charging a retry when its owner is busy."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        return await self.forwarding_tasks.update_one(
+            {"task_id": str(task_id), "lease_owner": self.worker_id},
+            {"$set": {
+                "status": "interrupted",
+                "retry_after": now + timedelta(seconds=max(1, int(delay_seconds))),
+                "updated_at": now,
+                "heartbeat_at": now,
+            },
+             "$inc": {"attempt": -1},
+             "$unset": {"lease_owner": "", "lease_expires_at": ""}},
         )
 
     async def heartbeat_owned_tasks(self):
