@@ -57,3 +57,17 @@ Telegram send/copy and MongoDB cannot participate in one atomic transaction. If 
 ## Verification status
 
 Repository inspection and branch edits are complete for the deployment/configuration stage. A live Heroku build, live Telegram forwarding test, and production recovery test require the owner's deployment environment and credentials; they are not claimed as passed here. Do not enable unattended auto-resume of large jobs until the recovery tests above pass.
+
+
+## Implementation status after recovery-stage changes
+
+The current branch now includes:
+- A dedicated MongoDB `forwarding_tasks` collection and `forwarding_message_outcomes` ledger.
+- Unique task/message indexes and idempotent outcome inserts.
+- Checkpoint writes for individual-copy outcomes and batch outcomes.
+- An explicit final partial-batch flush.
+- Startup detection of tasks left in `running` / `recovering` and owner notification while retaining checkpoints.
+
+**Important remaining gap:** automatic re-execution from the saved checkpoint is not yet enabled. The task envelope does not yet persist every runtime dependency (notably a validated, recoverable node credential reference and all filter/duplicate-check settings), and replaying from a cursor without reconciling destination messages can duplicate content. Startup therefore surfaces interrupted tasks instead of silently replaying them. This is safer than losing task records, but it does not satisfy unattended automatic recovery yet.
+
+The next implementation stage must persist the complete sanitized execution plan, restore/revalidate the chosen node, implement a lease-based resume worker that reuses the same forwarding engine, and add crash-window tests. Do not describe this branch as providing automatic resume until that stage is complete.
