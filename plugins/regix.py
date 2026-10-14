@@ -123,6 +123,19 @@ async def execute_public_forwarding(bot, callback_query):
     # Ready for Transmission
     temp.forwardings += 1
     await db.add_frwd(client_id)
+    task_id = str(transmission_id)
+    await db.ensure_forwarding_indexes()
+    await db.create_forwarding_task({
+        "task_id": task_id, "owner_id": int(client_id),
+        "source_chat_id": transmission_state.get("FROM"),
+        "destination_chat_id": transmission_state.get("TO"),
+        "limit": int(transmission_state.get("limit") or 0),
+        "skip": int(transmission_state.get("skip") or 0),
+        "active_node_id": active_node.get("id"),
+        "active_node_is_bot": bool(active_node.get("is_bot")),
+        "forward_tag": bool(tag_flag), "protect_content": bool(protect_flag),
+        "caption_template": cap_payload, "transmission_id": str(transmission_id),
+    })
     await dispatch_alert(node_client, client_id, "<b>🚀 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ᴇɴɢɪɴᴇ ɪɢɴɪᴛᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ!</b>")
     
     transmission_state.add(time=True)
@@ -160,12 +173,15 @@ async def execute_public_forwarding(bot, callback_query):
                 # Filter Handlers
                 if msg_obj == "DUPLICATE":
                    transmission_state.add('duplicate')
-                   continue 
+                   await db.checkpoint_forwarding_message(task_id, transmission_state.get('fetched'), "skipped", "duplicate")
+                   continue
                 elif msg_obj == "FILTERED":
                    transmission_state.add('filtered')
-                   continue 
+                   await db.checkpoint_forwarding_message(task_id, transmission_state.get('fetched'), "skipped", "filtered")
+                   continue
                 if msg_obj.empty or msg_obj.service:
                    transmission_state.add('deleted')
+                   await db.checkpoint_forwarding_message(task_id, msg_obj.id, "skipped", "empty_or_service")
                    continue
                    
                 # Forwarding Protocol (With tag)
@@ -176,8 +192,12 @@ async def execute_public_forwarding(bot, callback_query):
                    
                    # Batch dispatcher
                    if (queue_size >= 100 or remaining_items <= 100): 
-                      await execute_batch_forward(node_client, MESSAGE_BATCH_QUEUE, status_msg, transmission_state, protect_flag)
-                      transmission_state.add('total_files', queue_size)
+                      batch_ids = list(MESSAGE_BATCH_QUEUE)
+                      batch_ok = await execute_batch_forward(node_client, batch_ids, status_msg, transmission_state, protect_flag)
+                      for source_message_id in batch_ids:
+                         await db.checkpoint_forwarding_message(task_id, source_message_id, "forwarded" if batch_ok else "failed", None if batch_ok else "batch forward failed")
+                      if batch_ok:
+                         transmission_state.add('total_files', queue_size)
                       await asyncio.sleep(10)
                       MESSAGE_BATCH_QUEUE = []
                       
@@ -191,9 +211,13 @@ async def execute_public_forwarding(bot, callback_query):
                        'button': inline_btn, 
                        "protect": protect_flag
                    }
-                   await execute_single_copy(node_client, extracted_details, status_msg, transmission_state)
-                   transmission_state.add('total_files')
-                   await asyncio.sleep(throttle_sleep) 
+                   copied = await execute_single_copy(node_client, extracted_details, status_msg, transmission_state)
+                   if copied:
+                      transmission_state.add('total_files')
+                      await db.checkpoint_forwarding_message(task_id, msg_obj.id, "forwarded")
+                   else:
+                      await db.checkpoint_forwarding_message(task_id, msg_obj.id, "failed", "copy failed; see worker logs")
+                   await asyncio.sleep(throttle_sleep)
                    
         except Exception as critical_err:
             sys_logger.error(f"Critical Transmission Error: {critical_err}")
@@ -201,6 +225,15 @@ async def execute_public_forwarding(bot, callback_query):
             temp.IS_FRWD_CHAT.remove(transmission_state.TO)
             return await terminate_node(node_client, client_id)
             
+        # Flush a trailing partial batch even when the remaining-count estimate is off.
+        if tag_flag and MESSAGE_BATCH_QUEUE:
+           tail_ids = list(MESSAGE_BATCH_QUEUE)
+           tail_ok = await execute_batch_forward(node_client, tail_ids, status_msg, transmission_state, protect_flag)
+           for source_message_id in tail_ids:
+              await db.checkpoint_forwarding_message(task_id, source_message_id, "forwarded" if tail_ok else "failed", None if tail_ok else "final batch failed")
+           if tail_ok:
+              transmission_state.add('total_files', len(tail_ids))
+        await db.update_forwarding_task(task_id, {"status": "completed"})
         # Success Cleanup
         temp.IS_FRWD_CHAT.remove(transmission_state.TO)
         await dispatch_alert(node_client, client_id, "<b>🎉 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ ᴄᴏᴍᴘʟᴇᴛᴇᴅ!</b>")
@@ -229,17 +262,19 @@ async def execute_single_copy(active_bot, msg_data, ui_msg, state_obj):
               message_id=msg_data.get("msg_id"),
               reply_markup=msg_data.get('button'),
               protect_content=msg_data.get("protect"))
+     return True
               
    except FloodWait as flood_err:
      sys_logger.warning(f"FloodWait triggered for {flood_err.value} seconds.")
      await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
      await asyncio.sleep(flood_err.value)
      await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
-     await execute_single_copy(active_bot, msg_data, ui_msg, state_obj)
+     return await execute_single_copy(active_bot, msg_data, ui_msg, state_obj)
      
    except Exception as copy_err:
      sys_logger.error(f"Copy Error: {copy_err}")
      state_obj.add('deleted')
+     return False
         
 async def execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag):
    """ Batch message forwarder with robust exception handling. """
@@ -249,13 +284,17 @@ async def execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure
            from_chat_id=state_obj.get('FROM'), 
            protect_content=secure_flag,
            message_ids=msg_batch)
+     return True
            
    except FloodWait as flood_err:
      sys_logger.warning(f"Batch Forward FloodWait: {flood_err.value}s.")
      await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
      await asyncio.sleep(flood_err.value)
      await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
-     await execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag)
+     return await execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag)
+   except Exception as batch_err:
+     sys_logger.error(f"Batch forward error: {batch_err}")
+     return False
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------
 # 🎨 ᴜɪ / ꜱᴛᴀᴛᴜꜱ ᴍᴀɴᴀɢᴇᴍᴇɴᴛ ꜰᴜɴᴄᴛɪᴏɴꜱ
