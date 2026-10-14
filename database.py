@@ -7,9 +7,10 @@
 
 
 from os import environ 
+import uuid
 from config import Config
 import motor.motor_asyncio
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 
 async def mongodb_version():
     x = MongoClient(Config.DB_URL)
@@ -24,7 +25,9 @@ class Database:
         self.bot = self.db.bots
         self.col = self.db.users
         self.nfy = self.db.notify
-        self.chl = self.db.channels 
+        self.chl = self.db.channels
+        # Per-process owner token used by forwarding-task leases.
+        self.worker_id = uuid.uuid4().hex
         
     def new_user(self, id, name):
         return dict(
@@ -176,6 +179,296 @@ class Database:
     async def get_all_frwd(self):
        return self.nfy.find({})
      
+    # Durable forwarding task ledger. The legacy notify collection is only
+    # for restart notices and must never be treated as task progress.
+    @property
+    def forwarding_tasks(self):
+        return self.db.forwarding_tasks
+
+    @property
+    def forwarding_message_outcomes(self):
+        return self.db.forwarding_message_outcomes
+
+    async def ensure_forwarding_indexes(self):
+        await self.forwarding_tasks.create_index("task_id", unique=True)
+        await self.forwarding_tasks.create_index([("status", 1), ("updated_at", 1)])
+        await self.forwarding_tasks.create_index([("status", 1), ("lease_expires_at", 1)])
+        await self.forwarding_tasks.create_index([("owner_id", 1), ("created_at", -1)])
+        await self.forwarding_message_outcomes.create_index(
+            [("task_id", 1), ("source_message_id", 1)], unique=True
+        )
+        await self.forwarding_message_outcomes.create_index(
+            [("task_id", 1), ("outcome", 1), ("source_message_id", -1)]
+        )
+
+    async def create_forwarding_task(self, task):
+        """Create a durable task envelope before the first source message is processed."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        payload = dict(task)
+        initial_cursor = int(payload.get("start_message_id", payload.get("skip", 0)) or 0)
+        payload.update({
+            "status": "running",
+            "created_at": now,
+            "updated_at": now,
+            "heartbeat_at": now,
+            "lease_owner": self.worker_id,
+            "lease_expires_at": now + timedelta(seconds=180),
+            "cursor_message_id": initial_cursor,
+            "last_confirmed_message_id": initial_cursor,
+            "counts": {"processed": 0, "forwarded": 0, "skipped": 0, "failed": 0},
+            "attempt": 0,
+        })
+        await self.forwarding_tasks.update_one(
+            {"task_id": str(payload["task_id"])}, {"$setOnInsert": payload}, upsert=True
+        )
+        return await self.forwarding_tasks.find_one({"task_id": str(payload["task_id"])})
+
+    async def claim_forwarding_task(self, task_id):
+        """Atomically claim an existing task when no other live lease owns it."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        query = {
+            "task_id": str(task_id),
+            "$or": [
+                {"status": "interrupted"},
+                {"status": "running", "lease_owner": self.worker_id},
+                {"status": "running", "lease_expires_at": {"$lte": now}},
+                {"status": "running", "lease_expires_at": {"$exists": False}},
+                {"status": "recovering", "lease_expires_at": {"$lte": now}},
+                {"status": "recovering", "lease_expires_at": {"$exists": False}},
+            ],
+        }
+        claimed = await self.forwarding_tasks.find_one_and_update(
+            query,
+            {"$set": {
+                "status": "running",
+                "lease_owner": self.worker_id,
+                "lease_expires_at": now + timedelta(seconds=180),
+                "heartbeat_at": now,
+                "updated_at": now,
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        return claimed
+
+    async def claim_next_recoverable_task(self, excluded_owner_ids=None):
+        """Claim one interrupted task or one running task whose lease has expired."""
+
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        query = {
+            "$and": [
+                {"attempt": {"$lt": 5}},
+                {"$or": [
+                    {"status": "interrupted"},
+                    {"status": "recovering", "$or": [
+                        {"lease_expires_at": {"$lte": now}},
+                        {"lease_expires_at": {"$exists": False}},
+                    ]},
+                    {"status": "running", "lease_expires_at": {"$lte": now}},
+                    {"status": "running", "lease_expires_at": {"$exists": False}},
+                ]},
+                {"$or": [
+                    {"retry_after": {"$lte": now}},
+                    {"retry_after": {"$exists": False}},
+                ]},
+            ]
+        }
+        excluded_owner_ids = [int(owner_id) for owner_id in (excluded_owner_ids or [])]
+        if excluded_owner_ids:
+            query["owner_id"] = {"$nin": excluded_owner_ids}
+        return await self.forwarding_tasks.find_one_and_update(
+            query,
+            {"$set": {
+                "status": "running",
+                "lease_owner": self.worker_id,
+                "lease_expires_at": now + timedelta(seconds=180),
+                "heartbeat_at": now,
+                "updated_at": now,
+            }, "$inc": {"attempt": 1},
+             "$unset": {"retry_after": ""}},
+            sort=[("updated_at", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def defer_forwarding_task(self, task_id, delay_seconds=15):
+        """Release a claimed task without charging a retry when its owner is busy."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        return await self.forwarding_tasks.update_one(
+            {"task_id": str(task_id), "lease_owner": self.worker_id},
+            {"$set": {
+                "status": "interrupted",
+                "retry_after": now + timedelta(seconds=max(1, int(delay_seconds))),
+                "updated_at": now,
+                "heartbeat_at": now,
+            },
+             "$inc": {"attempt": -1},
+             "$unset": {"lease_owner": "", "lease_expires_at": ""}},
+        )
+
+    async def owns_forwarding_lease(self, task_id):
+        """Return whether this worker still owns a non-expired lease for a task."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        return bool(await self.forwarding_tasks.find_one(
+            {
+                "task_id": str(task_id),
+                "status": "running",
+                "lease_owner": self.worker_id,
+                "lease_expires_at": {"$gt": now},
+            },
+            {"_id": 1},
+        ))
+
+    async def heartbeat_owned_tasks(self):
+        """Renew all leases currently owned by this process."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        return await self.forwarding_tasks.update_many(
+            {"status": "running", "lease_owner": self.worker_id},
+            {"$set": {
+                "heartbeat_at": now,
+                "lease_expires_at": now + timedelta(seconds=180),
+                "updated_at": now,
+            }},
+        )
+
+    async def checkpoint_forwarding_message(self, task_id, source_message_id, outcome, error=None):
+        """Persist one terminal outcome; duplicate writes never increment counters twice."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        message_id = int(source_message_id)
+        key = {"task_id": str(task_id), "source_message_id": message_id}
+        try:
+            await self.forwarding_message_outcomes.insert_one({
+                **key,
+                "outcome": outcome,
+                "error": str(error)[:1000] if error else None,
+                "created_at": now,
+            })
+        except Exception as exc:
+            # If the outcome insert succeeded just before a crash but its cursor
+            # update did not, replaying this checkpoint repairs the cursor without
+            # incrementing outcome counters twice.
+            if getattr(exc, "code", None) == 11000:
+                repaired = await self.forwarding_tasks.update_one(
+                    {"task_id": str(task_id), "status": "running", "lease_owner": self.worker_id},
+                    {"$max": {
+                        "cursor_message_id": message_id,
+                        "last_confirmed_message_id": message_id,
+                    },
+                     "$set": {
+                         "updated_at": now,
+                         "heartbeat_at": now,
+                         "lease_expires_at": now + timedelta(seconds=180),
+                     }},
+                )
+                if repaired.matched_count == 0:
+                    raise RuntimeError(f"Lost forwarding-task lease for {task_id}")
+                return False
+            raise
+
+        count_key = (
+            "forwarded" if outcome == "forwarded"
+            else "failed" if outcome == "failed"
+            else "skipped"
+        )
+        result = await self.forwarding_tasks.update_one(
+            {"task_id": str(task_id), "status": "running", "lease_owner": self.worker_id},
+            {"$max": {
+                "cursor_message_id": message_id,
+                "last_confirmed_message_id": message_id,
+            },
+             "$inc": {f"counts.{count_key}": 1, "counts.processed": 1},
+             "$set": {
+                 "updated_at": now,
+                 "heartbeat_at": now,
+                 "lease_expires_at": now + timedelta(seconds=180),
+             }},
+        )
+        if result.matched_count == 0:
+            raise RuntimeError(f"Lost forwarding-task lease for {task_id}")
+        return True
+
+    async def update_forwarding_task(self, task_id, fields):
+        from datetime import datetime, timedelta, timezone
+
+        payload = dict(fields)
+        now = datetime.now(timezone.utc)
+        payload["updated_at"] = now
+        payload["heartbeat_at"] = now
+        update = {"$set": payload}
+        if payload.get("status") not in (None, "running", "recovering"):
+            update["$unset"] = {"lease_owner": "", "lease_expires_at": ""}
+        elif payload.get("status") in ("running", "recovering"):
+            payload["lease_expires_at"] = now + timedelta(seconds=180)
+            payload.setdefault("lease_owner", self.worker_id)
+        await self.forwarding_tasks.update_one(
+            {"task_id": str(task_id), "lease_owner": self.worker_id}, update
+        )
+
+    async def get_latest_forwarding_task(self, owner_id):
+        return await self.forwarding_tasks.find_one(
+            {"owner_id": int(owner_id)}, sort=[("created_at", -1)]
+        )
+
+    async def get_forwarding_task(self, task_id):
+        return await self.forwarding_tasks.find_one({"task_id": str(task_id)})
+
+    async def get_forwarding_message_outcome(self, task_id, source_message_id):
+        return await self.forwarding_message_outcomes.find_one(
+            {"task_id": str(task_id), "source_message_id": int(source_message_id)},
+            {"_id": 0, "outcome": 1, "error": 1},
+        )
+
+    async def get_failed_message_ids(self, task_id, limit=10):
+        cursor = self.forwarding_message_outcomes.find(
+            {"task_id": str(task_id), "outcome": "failed"},
+            {"_id": 0, "source_message_id": 1},
+        ).sort("source_message_id", -1).limit(max(1, min(int(limit), 10)))
+        return [doc["source_message_id"] async for doc in cursor]
+
+    async def get_forwarding_outcome_counts(self, task_id):
+        counts = {"forwarded": 0, "skipped": 0, "failed": 0}
+        pipeline = [
+            {"$match": {"task_id": str(task_id)}},
+            {"$group": {"_id": "$outcome", "count": {"$sum": 1}}},
+        ]
+        async for row in self.forwarding_message_outcomes.aggregate(pipeline):
+            if row["_id"] in counts:
+                counts[row["_id"]] = row["count"]
+        return counts
+
+    async def get_node_for_task(self, owner_id, node_id):
+        return await self.bot.find_one({"user_id": int(owner_id), "id": int(node_id)})
+
+    async def mark_interrupted_forwarding_tasks(self):
+        """Mark only tasks with expired/no lease; never interrupt a live worker."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        result = await self.forwarding_tasks.update_many(
+            {"status": "running", "$or": [
+                {"lease_expires_at": {"$lte": now}},
+                {"lease_expires_at": {"$exists": False}},
+            ]},
+            {"$set": {
+                "status": "interrupted",
+                "updated_at": now,
+                "recovery_note": "Worker lease expired; checkpoint retained for recovery.",
+            }, "$unset": {"lease_owner": "", "lease_expires_at": ""}},
+        )
+        return result.modified_count
+
 db = Database(Config.DB_URL, Config.DB_NAME)
 
 

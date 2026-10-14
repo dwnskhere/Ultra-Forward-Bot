@@ -42,24 +42,43 @@ async def start_clone_bot(NodeEngine, data=None):
    await NodeEngine.start()
    
    async def custom_message_iterator(
-      self, 
-      chat_id: Union[int, str], 
-      limit: int, 
+      self,
+      chat_id: Union[int, str],
+      limit: int,
       offset: int = 0,
       search: str = None,
       filter: "types.TypeMessagesFilter" = None,
       ) -> Optional[AsyncGenerator["types.Message", None]]:
-        
-        current_offset = offset
-        while True:
-            fetch_diff = min(200, limit - current_offset)
-            if fetch_diff <= 0:
+        """
+        Iterate source message IDs in ascending order.
+
+        `limit` is the final source message ID boundary and `offset` is the
+        last ID already confirmed. The next requested ID is therefore offset+1.
+        Advancing by the requested ID range (not response length) avoids the
+        old inclusive-boundary overlap and prevents empty/deleted IDs from
+        trapping the iterator in the same range forever.
+        """
+        current_id = max(0, int(offset or 0))
+        final_id = max(0, int(limit or 0))
+        while current_id < final_id:
+            batch_end = min(final_id, current_id + 200)
+            requested_ids = list(range(max(1, current_id + 1), batch_end + 1))
+            if not requested_ids:
                 return
-            fetched_messages = await self.get_messages(chat_id, list(range(current_offset, current_offset + fetch_diff + 1)))
+            fetched_messages = await self.get_messages(chat_id, requested_ids)
+            if not isinstance(fetched_messages, (list, tuple)):
+                fetched_messages = [fetched_messages] if fetched_messages else []
+            # Source IDs must be yielded in ascending order: the durable cursor is
+            # monotonic, so reverse-ordered API results could skip unprocessed IDs.
+            fetched_messages = sorted(
+                (item for item in fetched_messages if item is not None),
+                key=lambda item: int(getattr(item, "id", 0) or 0),
+            )
             for single_msg in fetched_messages:
-                yield single_msg
-                current_offset += 1
-                
+                if single_msg is not None:
+                    yield single_msg
+            current_id = batch_end
+
    NodeEngine.iter_messages = custom_message_iterator
    return NodeEngine
 

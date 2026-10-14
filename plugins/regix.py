@@ -123,6 +123,43 @@ async def execute_public_forwarding(bot, callback_query):
     # Ready for Transmission
     temp.forwardings += 1
     await db.add_frwd(client_id)
+    task_id = str(transmission_id)
+    await db.ensure_forwarding_indexes()
+    node_configs = await db.get_configs(client_id)
+    await db.create_forwarding_task({
+        "task_id": task_id, "owner_id": int(client_id),
+        "source_chat_id": transmission_state.get("FROM"),
+        "destination_chat_id": transmission_state.get("TO"),
+        "limit": int(transmission_state.get("limit") or 0),
+        "skip": int(transmission_state.get("skip") or 0),
+        "start_message_id": int(transmission_state.get("skip") or 0),
+        "active_node_id": active_node.get("id"),
+        "active_node_is_bot": bool(active_node.get("is_bot")),
+        "forward_tag": bool(tag_flag), "protect_content": bool(protect_flag),
+        "caption_template": cap_payload, "button_payload": node_configs.get("button"),
+        "settings_snapshot": {
+            "filters": metadata.get("filters"),
+            "keywords": metadata.get("keywords"),
+            "media_size": metadata.get("media_size"),
+            "extensions": metadata.get("extensions"),
+            "skip_duplicate_enabled": bool(metadata.get("skip_duplicate")),
+        },
+        "transmission_id": str(transmission_id),
+    })
+    claimed_task = await db.claim_forwarding_task(task_id)
+    if not claimed_task:
+        await edit_display_msg(status_msg, "<b>⚠️ ᴛʜɪꜱ ᴛᴀꜱᴋ ɪꜱ ᴀʟʀᴇᴀᴅʏ ʙᴇɪɴɢ ᴘʀᴏᴄᴇꜱꜱᴇᴅ ʙʏ ᴀɴᴏᴛʜᴇʀ ᴡᴏʀᴋᴇʀ.</b>")
+        return await terminate_node(node_client, client_id)
+
+    # Continue strictly after the last persisted source ID, restoring durable counters.
+    resume_cursor = int(claimed_task.get("last_confirmed_message_id",
+                                         claimed_task.get("cursor_message_id", 0)) or 0)
+    cached_state = transmission_state.get()
+    cached_state["fetched"] = resume_cursor
+    persisted_counts = claimed_task.get("counts", {})
+    cached_state["total_files"] = int(persisted_counts.get("forwarded", 0))
+    cached_state["deleted"] = int(persisted_counts.get("failed", 0))
+    cached_state["duplicate"] = int(persisted_counts.get("skipped", 0))
     await dispatch_alert(node_client, client_id, "<b>🚀 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ᴇɴɢɪɴᴇ ɪɢɴɪᴛᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ!</b>")
     
     transmission_state.add(time=True)
@@ -145,14 +182,16 @@ async def execute_public_forwarding(bot, callback_query):
             node_client,
             chat_id=transmission_state.get('FROM'), 
             limit=int(transmission_state.get('limit')), 
-            offset=int(transmission_state.get('skip')) if transmission_state.get('skip') else 0
+            offset=resume_cursor
             ):
                 # Check for kill switch
                 if await verify_kill_switch(node_client, client_id, status_msg, transmission_state):
                    return
                    
                 # Throttle UI Updates
-                if loop_counter % 20 == 0: 
+                if loop_counter % 20 == 0:
+                   if not await db.owns_forwarding_lease(task_id):
+                      raise RuntimeError("Forwarding task lease was lost; stopping this worker.")
                    await refresh_ui_status(status_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, transmission_state)
                 loop_counter += 1
                 transmission_state.add('fetched')
@@ -160,24 +199,44 @@ async def execute_public_forwarding(bot, callback_query):
                 # Filter Handlers
                 if msg_obj == "DUPLICATE":
                    transmission_state.add('duplicate')
-                   continue 
+                   continue
                 elif msg_obj == "FILTERED":
                    transmission_state.add('filtered')
-                   continue 
+                   continue
                 if msg_obj.empty or msg_obj.service:
+                   # Do not let a later skipped ID advance the cursor past messages
+                   # still waiting in an uncheckpointed native-forward batch.
+                   if tag_flag and MESSAGE_BATCH_QUEUE:
+                      pending_ids = list(MESSAGE_BATCH_QUEUE)
+                      pending_ok = await execute_batch_forward(
+                          node_client, pending_ids, status_msg, transmission_state, protect_flag
+                      )
+                      for pending_id in pending_ids:
+                         await db.checkpoint_forwarding_message(
+                             task_id, pending_id,
+                             "forwarded" if pending_ok else "failed",
+                             None if pending_ok else "batch forward failed",
+                         )
+                      if pending_ok:
+                         transmission_state.add('total_files', len(pending_ids))
+                      MESSAGE_BATCH_QUEUE = []
                    transmission_state.add('deleted')
+                   await db.checkpoint_forwarding_message(task_id, msg_obj.id, "skipped", "empty_or_service")
                    continue
                    
                 # Forwarding Protocol (With tag)
                 if tag_flag:
                    MESSAGE_BATCH_QUEUE.append(msg_obj.id)
                    queue_size = len(MESSAGE_BATCH_QUEUE)
-                   remaining_items = transmission_state.get('total') - transmission_state.get('fetched')
-                   
-                   # Batch dispatcher
-                   if (queue_size >= 100 or remaining_items <= 100): 
-                      await execute_batch_forward(node_client, MESSAGE_BATCH_QUEUE, status_msg, transmission_state, protect_flag)
-                      transmission_state.add('total_files', queue_size)
+
+                   # Keep the uncheckpointed replay window small and bounded.
+                   if queue_size >= 50: 
+                      batch_ids = list(MESSAGE_BATCH_QUEUE)
+                      batch_ok = await execute_batch_forward(node_client, batch_ids, status_msg, transmission_state, protect_flag)
+                      for source_message_id in batch_ids:
+                         await db.checkpoint_forwarding_message(task_id, source_message_id, "forwarded" if batch_ok else "failed", None if batch_ok else "batch forward failed")
+                      if batch_ok:
+                         transmission_state.add('total_files', queue_size)
                       await asyncio.sleep(10)
                       MESSAGE_BATCH_QUEUE = []
                       
@@ -191,19 +250,51 @@ async def execute_public_forwarding(bot, callback_query):
                        'button': inline_btn, 
                        "protect": protect_flag
                    }
-                   await execute_single_copy(node_client, extracted_details, status_msg, transmission_state)
-                   transmission_state.add('total_files')
-                   await asyncio.sleep(throttle_sleep) 
+                   copied = await execute_single_copy(node_client, extracted_details, status_msg, transmission_state)
+                   if copied:
+                      transmission_state.add('total_files')
+                      await db.checkpoint_forwarding_message(task_id, msg_obj.id, "forwarded")
+                   else:
+                      await db.checkpoint_forwarding_message(task_id, msg_obj.id, "failed", "copy failed; see worker logs")
+                   await asyncio.sleep(throttle_sleep)
                    
         except Exception as critical_err:
             sys_logger.error(f"Critical Transmission Error: {critical_err}")
+            from datetime import datetime, timedelta, timezone
+            await db.update_forwarding_task(task_id, {
+                "status": "interrupted",
+                "last_error": str(critical_err)[:1000],
+                "retry_after": datetime.now(timezone.utc) + timedelta(seconds=30),
+            })
             await edit_display_msg(status_msg, f"<blockquote><b><u>❌ ꜰᴀᴛᴀʟ ꜱʏꜱᴛᴇᴍ ᴇʀʀᴏʀ</u></b></blockquote>\n\n<code>{critical_err}</code>\n\n<b>🛡️ @IND_BOTZ</b>", wait=True)
-            temp.IS_FRWD_CHAT.remove(transmission_state.TO)
+            if transmission_state.TO in temp.IS_FRWD_CHAT:
+                temp.IS_FRWD_CHAT.remove(transmission_state.TO)
             return await terminate_node(node_client, client_id)
             
+        # Flush a trailing partial batch even when the remaining-count estimate is off.
+        if tag_flag and MESSAGE_BATCH_QUEUE:
+           tail_ids = list(MESSAGE_BATCH_QUEUE)
+           tail_ok = await execute_batch_forward(node_client, tail_ids, status_msg, transmission_state, protect_flag)
+           for source_message_id in tail_ids:
+              await db.checkpoint_forwarding_message(task_id, source_message_id, "forwarded" if tail_ok else "failed", None if tail_ok else "final batch failed")
+           if tail_ok:
+              transmission_state.add('total_files', len(tail_ids))
+        durable_task = await db.get_forwarding_task(task_id)
+        durable_counts = (durable_task or {}).get("counts", {})
+        final_task_status = "completed_with_errors" if durable_counts.get("failed", 0) else "completed"
+        await db.update_forwarding_task(task_id, {
+            "status": final_task_status,
+            "completed_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        })
         # Success Cleanup
         temp.IS_FRWD_CHAT.remove(transmission_state.TO)
-        await dispatch_alert(node_client, client_id, "<b>🎉 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ ᴄᴏᴍᴘʟᴇᴛᴇᴅ!</b>")
+        if final_task_status == "completed_with_errors":
+            await dispatch_alert(
+                node_client, client_id,
+                f"<b>⚠️ ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜰɪɴɪꜱʜᴇᴅ ᴡɪᴛʜ {durable_counts.get('failed', 0)} ᴅᴇʟɪᴠᴇʀʏ ᴇʀʀᴏʀꜱ.</b> ᴜꜱᴇ <code>/fwdstatus</code> ᴛᴏ ʀᴇᴠɪᴇᴡ ᴛʜᴇᴍ."
+            )
+        else:
+            await dispatch_alert(node_client, client_id, "<b>🎉 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ ᴄᴏᴍᴘʟᴇᴛᴇᴅ!</b>")
         await refresh_ui_status(status_msg, 'ᴄᴏᴍᴘʟᴇᴛᴇᴅ', "completed", transmission_state) 
         await terminate_node(node_client, client_id)
 
@@ -212,50 +303,77 @@ async def execute_public_forwarding(bot, callback_query):
 # ------------------------------------------------------------------------------------------------------------------------------------------------
             
 async def execute_single_copy(active_bot, msg_data, ui_msg, state_obj):
-   """ Highly secured function to copy individual messages and handle FloodWaits smoothly. """
-   try:                                  
-     if msg_data.get("media") and msg_data.get("caption"):
-        await active_bot.send_cached_media(
-              chat_id=state_obj.get('TO'),
-              file_id=msg_data.get("media"),
-              caption=msg_data.get("caption"),
-              reply_markup=msg_data.get('button'),
-              protect_content=msg_data.get("protect"))
-     else:
-        await active_bot.copy_message(
-              chat_id=state_obj.get('TO'),
-              from_chat_id=state_obj.get('FROM'),    
-              caption=msg_data.get("caption"),
-              message_id=msg_data.get("msg_id"),
-              reply_markup=msg_data.get('button'),
-              protect_content=msg_data.get("protect"))
-              
-   except FloodWait as flood_err:
-     sys_logger.warning(f"FloodWait triggered for {flood_err.value} seconds.")
-     await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
-     await asyncio.sleep(flood_err.value)
-     await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
-     await execute_single_copy(active_bot, msg_data, ui_msg, state_obj)
-     
-   except Exception as copy_err:
-     sys_logger.error(f"Copy Error: {copy_err}")
-     state_obj.add('deleted')
-        
+   """Copy a message, retrying unexpected failures at most three times."""
+   attempt = 0
+   while attempt < 3:
+     try:
+       if msg_data.get("media") and msg_data.get("caption"):
+         await active_bot.send_cached_media(
+             chat_id=state_obj.get('TO'),
+             file_id=msg_data.get("media"),
+             caption=msg_data.get("caption"),
+             reply_markup=msg_data.get('button'),
+             protect_content=msg_data.get("protect"))
+       else:
+         await active_bot.copy_message(
+             chat_id=state_obj.get('TO'),
+             from_chat_id=state_obj.get('FROM'),
+             caption=msg_data.get("caption"),
+             message_id=msg_data.get("msg_id"),
+             reply_markup=msg_data.get('button'),
+             protect_content=msg_data.get("protect"))
+       return True
+     except FloodWait as flood_err:
+       sys_logger.warning("FloodWait triggered for %s seconds.", flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
+       await asyncio.sleep(flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
+       # A Telegram rate limit is a required wait, not a consumed retry attempt.
+     except RPCError as copy_err:
+       sys_logger.error("Telegram copy failed: %s", copy_err)
+       state_obj.add('deleted')
+       return False
+     except Exception as copy_err:
+       attempt += 1
+       sys_logger.warning("Unexpected copy error (attempt %s/3): %s", attempt, copy_err)
+       if attempt >= 3:
+         state_obj.add('deleted')
+         return False
+       await asyncio.sleep(2 ** (attempt - 1))
+   return False
+
+
 async def execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag):
-   """ Batch message forwarder with robust exception handling. """
-   try:                             
-     await active_bot.forward_messages(
+   """Forward a batch, retrying unexpected transport errors at most three times."""
+   attempt = 0
+   while attempt < 3:
+     try:
+       await active_bot.forward_messages(
            chat_id=state_obj.get('TO'),
-           from_chat_id=state_obj.get('FROM'), 
+           from_chat_id=state_obj.get('FROM'),
            protect_content=secure_flag,
            message_ids=msg_batch)
-           
-   except FloodWait as flood_err:
-     sys_logger.warning(f"Batch Forward FloodWait: {flood_err.value}s.")
-     await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
-     await asyncio.sleep(flood_err.value)
-     await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
-     await execute_batch_forward(active_bot, msg_batch, ui_msg, state_obj, secure_flag)
+       return True
+     except FloodWait as flood_err:
+       sys_logger.warning("Batch forward FloodWait: %ss.", flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ꜱʟᴇᴇᴘɪɴɢ', flood_err.value, state_obj)
+       await asyncio.sleep(flood_err.value)
+       if ui_msg is not None:
+         await refresh_ui_status(ui_msg, 'ᴘʀᴏɢʀᴇꜱꜱɪɴɢ', 10, state_obj)
+       # Keep waiting through rate limits without consuming the transient retry budget.
+     except RPCError as batch_err:
+       sys_logger.error("Telegram batch forward failed: %s", batch_err)
+       return False
+     except Exception as batch_err:
+       attempt += 1
+       sys_logger.warning("Unexpected batch forward error (attempt %s/3): %s", attempt, batch_err)
+       if attempt >= 3:
+         return False
+       await asyncio.sleep(2 ** (attempt - 1))
+   return False
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------
 # 🎨 ᴜɪ / ꜱᴛᴀᴛᴜꜱ ᴍᴀɴᴀɢᴇᴍᴇɴᴛ ꜰᴜɴᴄᴛɪᴏɴꜱ
@@ -332,6 +450,7 @@ async def verify_kill_switch(active_bot, client_id, ui_msg, state_obj):
       sys_logger.info(f"Kill switch activated for client {client_id}")
       temp.IS_FRWD_CHAT.remove(state_obj.TO)
       await refresh_ui_status(ui_msg, "ᴀʙᴏʀᴛᴇᴅ", "cancelled", state_obj)
+      await db.update_forwarding_task(str(state_obj.id), {"status": "cancelled"})
       await dispatch_alert(active_bot, client_id, "<b>❌ ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ᴀʙᴏʀᴛᴇᴅ ʙʏ ᴜꜱᴇʀ.</b>")
       await terminate_node(active_bot, client_id)
       return True 

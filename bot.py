@@ -11,7 +11,7 @@ import asyncio
 import logging 
 import logging.config
 from database import db 
-from config import Config  
+from config import Config, temp  
 from pyrogram import Client, __version__
 from pyrogram.raw.all import layer 
 from pyrogram.enums import ParseMode
@@ -45,6 +45,19 @@ class Bot(Client):
         self.set_parse_mode(ParseMode.DEFAULT)
         text = "**Bot Restarted !**"
         logging.info(text)
+
+        # Create indexes and start lease/heartbeat-based task recovery.
+        await db.ensure_forwarding_indexes()
+        stale_count = await db.mark_interrupted_forwarding_tasks()
+        if stale_count:
+            logging.warning("Marked %s forwarding task(s) with expired leases for recovery.", stale_count)
+        self._forwarding_heartbeat_task = asyncio.create_task(
+            self._forwarding_heartbeat_loop(), name="forwarding-lease-heartbeat"
+        )
+        self._forwarding_recovery_task = asyncio.create_task(
+            self._forwarding_recovery_loop(), name="forwarding-recovery-worker"
+        )
+
         success = failed = 0
         users = await db.get_all_frwd()
         async for user in users:
@@ -65,8 +78,84 @@ class Bot(Client):
                  f"success: {success}"
                  f"failed: {failed}")
 
+    async def _forwarding_heartbeat_loop(self):
+        """Keep active-task leases alive independently of long recovery runs."""
+        while True:
+            try:
+                await db.heartbeat_owned_tasks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Forwarding lease heartbeat failed")
+            await asyncio.sleep(15)
+
+    async def _forwarding_recovery_loop(self):
+        """Renew live leases and resume abandoned tasks one at a time."""
+        while True:
+            try:
+                await db.mark_interrupted_forwarding_tasks()
+                busy_owners = [
+                    int(owner_id) for owner_id, is_locked in temp.lock.items() if is_locked
+                ]
+                task = await db.claim_next_recoverable_task(
+                    excluded_owner_ids=busy_owners
+                )
+                if task:
+                    from datetime import datetime, timedelta, timezone
+                    from plugins.recovery import recover_forwarding_task, retry_delay_seconds
+
+                    task_id = str(task["task_id"])
+                    attempt = int(task.get("attempt", 1))
+                    try:
+                        await recover_forwarding_task(self, task)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as recovery_error:
+                        error_text = str(recovery_error)[:1000]
+                        if attempt >= 5:
+                            await db.update_forwarding_task(task_id, {
+                                "status": "needs_attention",
+                                "last_error": error_text,
+                                "recovery_note": "Automatic recovery stopped after five failed attempts.",
+                            })
+                            try:
+                                await self.send_message(
+                                    int(task["owner_id"]),
+                                    f"Forwarding task {task_id} could not be recovered after five attempts. "
+                                    f"Last error: {error_text}",
+                                )
+                            except Exception:
+                                logging.warning("Could not notify owner about task %s", task_id)
+                        else:
+                            retry_after = datetime.now(timezone.utc) + timedelta(
+                                seconds=retry_delay_seconds(attempt)
+                            )
+                            await db.update_forwarding_task(task_id, {
+                                "status": "interrupted",
+                                "last_error": error_text,
+                                "retry_after": retry_after,
+                            })
+                            logging.warning(
+                                "Task %s recovery attempt %s failed; retrying after %s: %s",
+                                task_id, attempt, retry_after.isoformat(), error_text,
+                            )
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Forwarding recovery worker iteration failed")
+            await asyncio.sleep(15)
+
     async def stop(self, *args):
         msg = f"@{self.username} stopped. Bye."
+        for task_name in ("_forwarding_recovery_task", "_forwarding_heartbeat_task"):
+            background_task = getattr(self, task_name, None)
+            if background_task and not background_task.done():
+                background_task.cancel()
+                try:
+                    await background_task
+                except asyncio.CancelledError:
+                    pass
         await super().stop()
         logging.info(msg)
 
