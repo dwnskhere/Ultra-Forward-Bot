@@ -270,7 +270,13 @@ async def execute_public_forwarding(bot, callback_query):
         })
         # Success Cleanup
         temp.IS_FRWD_CHAT.remove(transmission_state.TO)
-        await dispatch_alert(node_client, client_id, "<b>🎉 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ ᴄᴏᴍᴘʟᴇᴛᴇᴅ!</b>")
+        if final_task_status == "completed_with_errors":
+            await dispatch_alert(
+                node_client, client_id,
+                f"<b>⚠️ ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜰɪɴɪꜱʜᴇᴅ ᴡɪᴛʜ {durable_counts.get('failed', 0)} ᴅᴇʟɪᴠᴇʀʏ ᴇʀʀᴏʀꜱ.</b> ᴜꜱᴇ <code>/fwdstatus</code> ᴛᴏ ʀᴇᴠɪᴇᴡ ᴛʜᴇᴍ."
+            )
+        else:
+            await dispatch_alert(node_client, client_id, "<b>🎉 ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ ᴄᴏᴍᴘʟᴇᴛᴇᴅ!</b>")
         await refresh_ui_status(status_msg, 'ᴄᴏᴍᴘʟᴇᴛᴇᴅ', "completed", transmission_state) 
         await terminate_node(node_client, client_id)
 
