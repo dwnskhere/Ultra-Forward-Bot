@@ -34,5 +34,12 @@
       "value": "IND_BOTZ_FORWARD",
       "required": false
     }
+  },
+  "stack": "container",
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
   }
 }
