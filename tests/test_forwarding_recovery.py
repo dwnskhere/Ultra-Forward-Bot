@@ -55,7 +55,7 @@ class SourceIteratorTests(unittest.IsolatedAsyncioTestCase):
 
             async def get_messages(self, chat_id, message_ids):
                 self.requested.append(list(message_ids))
-                return [SimpleNamespace(id=message_id) for message_id in message_ids]
+                return [SimpleNamespace(id=message_id) for message_id in reversed(message_ids)]
 
         node = FakeNode()
         await start_clone_bot(node)
