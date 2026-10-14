@@ -22,6 +22,7 @@ class Translation(object):
 <b><u>📌 ꜱʏꜱᴛᴇᴍ ᴄᴏᴍᴍᴀɴᴅꜱ :</u></b>
 ⏣ <code>/start</code> - <b>ɪɴɪᴛɪᴀʟɪᴢᴇ ᴛʜᴇ ᴇɴɢɪɴᴇ</b>
 ⏣ <code>/forward</code> - <b>ʙᴇɢɪɴ ᴛʀᴀɴꜱᴍɪꜱꜱɪᴏɴ</b>
+⏣ <code>/fwdstatus</code> - <b>ᴠɪᴇᴡ ᴘʀᴏɢʀᴇꜱꜱ ᴀɴᴅ ꜰᴀɪʟᴇᴅ ᴍᴇꜱꜱᴀɢᴇꜱ</b>
 ⏣ <code>/unequify</code> - <b>ᴄʟᴇᴀɴ ᴜᴘ ᴅᴜᴘʟɪᴄᴀᴛᴇ ᴅᴀᴛᴀ</b>
 ⏣ <code>/settings</code> - <b>ᴏᴘᴇɴ ᴄᴏɴꜰɪɢᴜʀᴀᴛɪᴏɴ</b>
 ⏣ <code>/reset</code> - <b>ʀᴇꜱᴛᴏʀᴇ ᴅᴇꜰᴀᴜʟᴛꜱ</b>
@@ -42,6 +43,7 @@ class Translation(object):
 ► <b>ɴᴀᴠɪɢᴀᴛᴇ ᴛᴏ <code>/settings</code> ᴛᴏ ᴀᴛᴛᴀᴄʜ ʏᴏᴜʀ ᴄʜᴀᴛꜱ.</b>
 ► <b>ꜰᴏʀ ᴘʀɪᴠᴀᴛᴇ ꜱᴏᴜʀᴄᴇꜱ, ʏᴏᴜʀ ᴜꜱᴇʀʙᴏᴛ ᴍᴜꜱᴛ ʙᴇ ᴀɴ ᴀᴄᴛɪᴠᴇ ᴍᴇᴍʙᴇʀ.</b>
 ► <b>ᴇxᴇᴄᴜᴛᴇ <code>/forward</code> ᴛᴏ ɪɢɴɪᴛᴇ ᴛʜᴇ ᴘʀᴏᴄᴇꜱꜱ.</b>
+► <b>ᴜꜱᴇ <code>/fwdstatus</code> ᴛᴏ ᴄʜᴇᴄᴋ ᴄᴏᴜɴᴛꜱ, ᴛʜᴇ ʟᴀꜱᴛ ᴄʜᴇᴄᴋᴘᴏɪɴᴛ, ᴀɴᴅ ᴋɴᴏᴡɴ ꜰᴀɪʟᴇᴅ ᴍᴇꜱꜱᴀɢᴇ ɪᴅꜱ.</b>
 
 <blockquote><b>🛡️ @IND_BOTZ</b></blockquote>"""
   
