@@ -137,7 +137,13 @@ async def execute_public_forwarding(bot, callback_query):
         "active_node_is_bot": bool(active_node.get("is_bot")),
         "forward_tag": bool(tag_flag), "protect_content": bool(protect_flag),
         "caption_template": cap_payload, "button_payload": node_configs.get("button"),
-        "settings_snapshot": metadata,
+        "settings_snapshot": {
+            "filters": metadata.get("filters"),
+            "keywords": metadata.get("keywords"),
+            "media_size": metadata.get("media_size"),
+            "extensions": metadata.get("extensions"),
+            "skip_duplicate_enabled": bool(metadata.get("skip_duplicate")),
+        },
         "transmission_id": str(transmission_id),
     })
     claimed_task = await db.claim_forwarding_task(task_id)
@@ -204,10 +210,9 @@ async def execute_public_forwarding(bot, callback_query):
                 if tag_flag:
                    MESSAGE_BATCH_QUEUE.append(msg_obj.id)
                    queue_size = len(MESSAGE_BATCH_QUEUE)
-                   remaining_items = transmission_state.get('total') - transmission_state.get('fetched')
-                   
-                   # Batch dispatcher
-                   if (queue_size >= 100 or remaining_items <= 100): 
+
+                   # Keep the uncheckpointed replay window small and bounded.
+                   if queue_size >= 50: 
                       batch_ids = list(MESSAGE_BATCH_QUEUE)
                       batch_ok = await execute_batch_forward(node_client, batch_ids, status_msg, transmission_state, protect_flag)
                       for source_message_id in batch_ids:
