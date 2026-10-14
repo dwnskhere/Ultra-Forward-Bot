@@ -15,6 +15,7 @@ os.environ.setdefault("BOT_TOKEN", "12345:test-token")
 
 from plugins.recovery import final_task_status, next_source_message_id, retry_delay_seconds
 from plugins.test import start_clone_bot
+from config import Config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,26 @@ class RecoveryHelperTests(unittest.TestCase):
         self.assertEqual(retry_delay_seconds(1), 5)
         self.assertEqual(retry_delay_seconds(2), 10)
         self.assertEqual(retry_delay_seconds(99), 300)
+
+    def test_api_id_validation_catches_swapped_api_hash(self):
+        saved = {
+            "API_ID": Config.API_ID,
+            "API_HASH": Config.API_HASH,
+            "BOT_TOKEN": Config.BOT_TOKEN,
+            "OWNER_ID": Config.OWNER_ID,
+            "DB_URL": Config.DB_URL,
+        }
+        try:
+            Config.API_ID = "ba47d01e4e399a799bd2e7e52dce250d"
+            Config.API_HASH = "test-api-hash"
+            Config.BOT_TOKEN = "12345:test-token"
+            Config.OWNER_ID = [12345]
+            Config.DB_URL = "mongodb://localhost:27017"
+            with self.assertRaisesRegex(RuntimeError, "API_ID.*numeric.*API_HASH"):
+                Config.validate()
+        finally:
+            for key, value in saved.items():
+                setattr(Config, key, value)
 
     def test_app_manifest_is_valid_json(self):
         with (ROOT / "app.json").open(encoding="utf-8") as manifest_file:
